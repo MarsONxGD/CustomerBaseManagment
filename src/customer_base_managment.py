@@ -1,28 +1,12 @@
+import csv
 import os
-import sys
 import subprocess
+import sys
 from pathlib import Path
 
 
-def print_help():
-    """Вывод справки по командам"""
-    print("\n" + "=" * 50)
-    print("📧 SoftwareCBM - КОМАНДЫ")
-    print("=" * 50)
-    print("receive-mail      - 📥 Получить новые письма (только ERROR логи)")
-    print("receive-mail-force - ⚡ Принудительно получить все письма")
-    print("cleanup-logs      - 🗑️  Очистить логи")
-    print("cleanup-data      - 🗂️  Очистить данные")
-    print("cleanup-all       - ⚠️  Очистить всё")
-    print("status            - 📊 Показать статус системы")
-    print("help              - 📖 Показать эту справку")
-    print("exit              - ❌ Выход")
-    print("=" * 50)
-
-
 def run_email_handler(force_mode=False):
-    """Запуск обработки писем"""
-    mode_text = "в форсированном режиме" if force_mode else "макс. 5 писем"
+    mode_text = "в форсированном режиме" if force_mode else "макс. 10 писем"
     print(f"\n🔄 Запуск обработки новых писем ({mode_text})...")
     try:
         if force_mode:
@@ -42,7 +26,6 @@ def run_email_handler(force_mode=False):
 
         print("✅ Обработка писем завершена")
 
-        # Для обычного режима показываем только ERROR логи
         if not force_mode:
             for line in result.stdout.split("\n"):
                 if "РЕЗУЛЬТАТ:" in line:
@@ -63,7 +46,6 @@ def run_email_handler(force_mode=False):
                         )
                         print(f"   {clean_line}")
         else:
-            # Для форсированного режима показываем весь вывод
             if result.stdout:
                 print("\n📋 Вывод программы:")
                 print(result.stdout)
@@ -75,8 +57,51 @@ def run_email_handler(force_mode=False):
         print(f"❌ Ошибка при запуске обработки писем: {e}")
 
 
+def show_results():
+    print("\n📊 Результаты обработки заявок:")
+
+    results_dir = Path("../temp/results")
+    csv_file = results_dir / "applications.csv"
+
+    if csv_file.exists():
+        with open(csv_file, "r", encoding="utf-8") as f:
+            applications = list(csv.DictReader(f))
+
+        if applications:
+            print(f"Найдено заявок: {len(applications)}")
+            print("\n" + "=" * 102)
+            print(f"{'Email':<50} {'Дата':<35} {'Тема'}")
+            print("=" * 102)
+
+            for app in applications:
+                print(
+                    f"{app['Email'][:48]:<50} {app['Date'][:33]:<35} {app['Subject'][:15]}"
+                )
+        else:
+            print("Заявки не найдены")
+    else:
+        print("Файл с результатами не найден")
+
+
+def show_articles():
+    print("\n🔍 Загруженные артикулы:")
+    try:
+        from article_matcher import ArticleMatcher
+
+        matcher = ArticleMatcher()
+        if matcher.articles:
+            articles_list = sorted(list(matcher.articles))
+            print(f"Всего артикулов: {len(articles_list)}")
+            print("Список артикулов:")
+            for i, article in enumerate(articles_list, 1):
+                print(f"  {i:2d}. {article}")
+        else:
+            print("Артикулы не загружены")
+    except Exception as e:
+        print(f"Ошибка при загрузке артикулов: {e}")
+
+
 def clear_logs():
-    """Очистка логов"""
     print("\n🗑️  Очистка логов...")
     log_dir = Path("../log")
     if log_dir.exists():
@@ -94,21 +119,18 @@ def clear_logs():
 
 
 def clear_data():
-    """Очистка данных"""
     print("\n🗂️  Очистка данных...")
-    data_dir = Path("../data/email")
+    data_dir = Path("../temp/email")
     if data_dir.exists():
         try:
             json_count = 0
             attachment_count = 0
 
-            # Удаляем JSON файлы
             for json_file in data_dir.glob("*.json"):
                 json_file.unlink()
                 print(f"   Удален JSON: {json_file.name}")
                 json_count += 1
 
-            # Удаляем вложения
             attachments_dir = data_dir / "attachments"
             if attachments_dir.exists():
                 for attachment_file in attachments_dir.glob("*"):
@@ -131,10 +153,8 @@ def clear_all():
 
 
 def show_status():
-    """Показать статус системы"""
     print("\n📊 Статус системы:")
 
-    # Проверяем логи
     log_dir = Path("../log")
     if log_dir.exists():
         log_files = list(log_dir.glob("*.log"))
@@ -148,8 +168,7 @@ def show_status():
     else:
         print("\n📁 Логи: папка не существует")
 
-    # Проверяем данные
-    data_dir = Path("../data/email")
+    data_dir = Path("../temp/email")
     if data_dir.exists():
         json_files = list(data_dir.glob("*.json"))
         attachments_dir = data_dir / "attachments"
@@ -171,10 +190,24 @@ def show_status():
         print("\n📁 Данные: папка не существует")
 
 
-def main():
-    """Основная функция интерактивного CLI с командами"""
+def print_help():
+    print("\n" + "=" * 50)
+    print("📧 SoftwareCBM - КОМАНДЫ")
+    print("=" * 50)
+    print("receive-mail      - 📥 Получить новые письма")
+    print("receive-mail-force - ⚡ Принудительно получить все письма")
+    print("show-results      - 📋 Показать найденные заявки")
+    print("show-articles     - 🔍 Показать загруженные артикулы")
+    print("cleanup-logs      - 🗑️  Очистить логи")
+    print("cleanup-temp      - 🗂️  Очистить данные")
+    print("cleanup-all       - ⚠️  Очистить всё")
+    print("status            - 📊 Показать статус системы")
+    print("help              - 📖 Показать эту справку")
+    print("exit              - ❌ Выход")
+    print("=" * 50)
 
-    # Проверяем существование email_handler.py
+
+def main():
     if not os.path.exists("email_handler.py"):
         print("❌ Файл email_handler.py не найден!")
         print("Убедитесь, что он находится в той же папке, что и этот скрипт")
@@ -192,9 +225,13 @@ def main():
                 run_email_handler(force_mode=False)
             elif command == "receive-mail-force":
                 run_email_handler(force_mode=True)
+            elif command == "show-results":
+                show_results()
+            elif command == "show-articles":
+                show_articles()
             elif command == "cleanup-logs":
                 clear_logs()
-            elif command == "cleanup-data":
+            elif command == "cleanup-temp":
                 clear_data()
             elif command == "cleanup-all":
                 clear_all()

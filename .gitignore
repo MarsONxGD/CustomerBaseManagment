@@ -4,8 +4,10 @@ __pycache__/
 .idea/
 
 # Project dirs
+datasets/
+models/
 config/
-data/
+temp/
 log/
 
 # Unnecessary files

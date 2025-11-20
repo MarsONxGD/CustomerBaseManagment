@@ -1,21 +1,25 @@
-import imaplib
 import email
+import imaplib
 import json
-import os
 import logging
-from email.header import decode_header
-from datetime import datetime
-import uuid
+import os
+import sys
 import time
-import config.email_config
+import uuid
+from email.header import decode_header
 
-# Настройка логирования
+from article_matcher import ArticleMatcher
+from attachment_processor import AttachmentProcessor
+from config.email_config import credentials
+from email_classifier.predict import EmailClassifierPredictor
+
+sys.path.append(os.path.dirname(__file__))
 os.makedirs("../log", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler("../log/email_handler.log", encoding="utf-8"),
+        logging.FileHandler("../log/softwarecbm.log", encoding="utf-8"),
         logging.StreamHandler(),
     ],
 )
@@ -23,7 +27,6 @@ logger = logging.getLogger(__name__)
 
 
 def decode_mime_words(text):
-    """Декодирование MIME заголовков"""
     if text is None:
         return ""
     decoded_parts = decode_header(text)
@@ -41,23 +44,161 @@ def decode_mime_words(text):
 
 class EmailHandler:
     def __init__(self):
-        self.config = config.email_config.credentials()
+        self.config = credentials()
         self.mail = None
-        self.data_dir = "../data/email"
-        self.attachments_dir = "../data/email/attachments"
         self.processed_dir = "PROCESSED"
+        self.spam_dir = "PROCESSED/SPAM"
+        self.correct_dir = "PROCESSED/CORRECT"
+        self.incorrect_dir = "PROCESSED/INCORRECT"
+        self.data_dir = "../temp/email"
+        self.attachments_dir = "../temp/email/attachments"
+        self.results_dir = "../temp/results"
 
-        # Настройки обработки
-        self.max_emails_per_run = 5
-        self.delay_between_emails = 2
+        self.classifier = EmailClassifierPredictor()
+        self.attachment_processor = AttachmentProcessor()
+        self.article_matcher = ArticleMatcher()
+
+        self.max_emails_per_run = 10
+        self.delay_between_emails = 1
         self.max_retries = 3
 
-        # Создаем необходимые директории
         os.makedirs(self.data_dir, exist_ok=True)
         os.makedirs(self.attachments_dir, exist_ok=True)
+        os.makedirs(self.results_dir, exist_ok=True)
+
+    def create_processed_folders(self):
+        try:
+            folders = [
+                self.processed_dir,
+                self.spam_dir,
+                self.correct_dir,
+                self.incorrect_dir,
+            ]
+            for folder in folders:
+                try:
+                    self.mail.create(folder)
+                    logger.info(f"Создана папка {folder}")
+                except Exception as e:
+                    logger.debug(
+                        f"Папка {folder} уже существует или не может быть создана: {e}"
+                    )
+        except Exception as e:
+            logger.error(f"Ошибка при создании папок: {e}")
+
+    def classify_email_basic(self, email_data):
+        try:
+            text_parts = []
+            if "body" in email_data:
+                if "plain" in email_data["body"]:
+                    text_parts.append(email_data["body"]["plain"])
+
+            email_text = "\n".join(text_parts)
+            email_text += f"\n{email_data.get('subject', '')}"
+
+            prediction = self.classifier.predict(email_text)
+
+            logger.info(
+                f"Классификация письма {email_data['id']}: {prediction['class_name']} (уверенность: {prediction['confidence']:.2%})"
+            )
+
+            return (
+                prediction["class_name"] == "Заявка",
+                prediction["confidence"],
+                email_text,
+            )
+
+        except Exception as e:
+            logger.error(
+                f"Ошибка при классификации письма {email_data.get('id', 'unknown')}: {e}"
+            )
+            return False, 0.0, ""
+
+    def extract_text_from_attachments(self, attachments):
+        combined_text = ""
+
+        for attachment in attachments:
+            attachment_path = os.path.join(
+                self.attachments_dir, attachment["saved_name"]
+            )
+            if os.path.exists(attachment_path):
+                logger.info(f"Обработка вложения: {attachment['filename']}")
+                extracted_text = self.attachment_processor.extract_text_from_file(
+                    attachment_path
+                )
+                if extracted_text:
+                    # combined_text += f"\n--- Текст из вложения {attachment['filename']} ---\n"
+                    combined_text += extracted_text + "\n"
+
+        return combined_text
+
+    def delete_email_files(self, email_id, attachments):
+        try:
+            json_path = os.path.join(self.data_dir, f"{email_id}.json")
+            if os.path.exists(json_path):
+                os.remove(json_path)
+                logger.info(f"Удален JSON файл: {json_path}")
+
+            for attachment in attachments:
+                attachment_path = os.path.join(
+                    self.attachments_dir, attachment["saved_name"]
+                )
+                if os.path.exists(attachment_path):
+                    os.remove(attachment_path)
+                    logger.info(f"Удалено вложение: {attachment_path}")
+
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка при удалении файлов письма {email_id}: {e}")
+            return False
+
+    def save_application_result(self, email_data, found_articles):
+        try:
+            if not found_articles:
+                logger.info(
+                    f"Для письма {email_data['id']} не найдены артикулы - результат не сохраняется"
+                )
+                return False
+
+            result = {
+                "email": email_data.get("from", ""),
+                "date": email_data.get("date", ""),
+                "subject": email_data.get("subject", ""),
+                "articles_count": len(found_articles),
+                "found_articles": found_articles,
+                "processed_date": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "email_id": email_data.get("id", ""),
+            }
+
+            result_filename = f"application_{email_data['id']}.json"
+            result_path = os.path.join(self.results_dir, result_filename)
+
+            with open(result_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+
+            csv_path = os.path.join(self.results_dir, "applications.csv")
+            csv_header = not os.path.exists(csv_path)
+
+            with open(csv_path, "a", encoding="utf-8") as f:
+                if csv_header:
+                    f.write(
+                        "Email,Date,Subject,ArticlesCount,FoundArticles,ProcessedDate\n"
+                    )
+
+                articles_str = ";".join(found_articles)
+                f.write(
+                    f"\"{result['email']}\",\"{result['date']}\",\"{result['subject']}\",{result['articles_count']},\"{articles_str}\",\"{result['processed_date']}\"\n"
+                )
+
+            logger.info(
+                f"Сохранена информация о заявке: {result['email']} (найдено артикулов: {len(found_articles)})"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении результата: {e}")
+            return False
 
     def connect(self):
-        """Подключение к IMAP серверу"""
         try:
             self.mail = imaplib.IMAP4_SSL(
                 self.config["imap_server"], self.config["imap_port"]
@@ -65,28 +206,27 @@ class EmailHandler:
             self.mail.socket().settimeout(60)
             self.mail.login(self.config["email"], self.config["password"])
             logger.info("Успешное подключение к почтовому серверу")
+
+            self.create_processed_folders()
+
             return True
         except Exception as e:
             logger.error(f"Ошибка подключения: {e}")
             return False
 
     def disconnect(self):
-        """Отключение от сервера"""
         if self.mail:
             try:
                 try:
-                    # Пытаемся выбрать INBOX, чтобы перевести соединение в состояние SELECTED
                     self.mail.select("INBOX")
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Команда select не выполнена: {e}")
 
-                # Закрываем текущий mailbox
                 try:
                     self.mail.close()
                 except Exception as e:
                     logger.debug(f"Команда close не выполнена: {e}")
 
-                # Выходим
                 try:
                     self.mail.logout()
                     logger.info("Успешное отключение от почтового сервера")
@@ -99,7 +239,6 @@ class EmailHandler:
                 self.mail = None
 
     def safe_connect(self):
-        """Безопасное подключение с повторными попытками"""
         for attempt in range(3):
             try:
                 if self.connect():
@@ -115,25 +254,20 @@ class EmailHandler:
         return False
 
     def save_attachment(self, part, email_id, attachment_number):
-        """Сохранение вложений"""
         filename = part.get_filename()
         if filename:
             filename = decode_mime_words(filename)
             if not filename:
                 filename = f"attachment_{uuid.uuid4().hex}"
 
-            # Очистка имени файла
             filename = "".join(
                 c for c in filename if c.isalnum() or c in (" ", "-", "_", ".")
             ).rstrip()
-
-            # Добавляем номер вложения к имени файла для уникальности
             filepath = os.path.join(
                 self.attachments_dir, f"{email_id}_{attachment_number}_{filename}"
             )
 
             try:
-                # Получаем содержимое вложения
                 payload = part.get_payload(decode=True)
                 if payload:
                     with open(filepath, "wb") as f:
@@ -158,31 +292,25 @@ class EmailHandler:
         return None
 
     def parse_email(self, msg, email_id):
-        """Парсинг письма и сохранение в JSON"""
         email_data = {
             "id": email_id,
             "subject": decode_mime_words(msg.get("Subject")),
             "from": decode_mime_words(msg.get("From")),
-            "to": decode_mime_words(msg.get("To")),
             "date": msg.get("Date"),
-            "processed_date": datetime.now().isoformat(),
             "body": {},
             "attachments": [],
         }
 
         attachment_counter = 0
 
-        # Обработка частей письма
         if msg.is_multipart():
             for part in msg.walk():
                 content_type = part.get_content_type()
                 content_disposition = str(part.get("Content-Disposition", ""))
 
-                # Пропускаем multipart контейнеры
                 if part.get_content_maintype() == "multipart":
                     continue
 
-                # Вложения - определяем по наличию filename
                 filename = part.get_filename()
                 if filename:
                     attachment_counter += 1
@@ -192,10 +320,8 @@ class EmailHandler:
                     )
                     if attachment_info:
                         email_data["attachments"].append(attachment_info)
-                    # Продолжаем обработку для других частей
                     continue
 
-                # Текст письма (обрабатываем только если это не вложение)
                 if (
                         content_type == "text/plain"
                         and "attachment" not in content_disposition.lower()
@@ -210,21 +336,7 @@ class EmailHandler:
                     except Exception as e:
                         logger.warning(f"Ошибка декодирования plain текста: {e}")
 
-                elif (
-                        content_type == "text/html"
-                        and "attachment" not in content_disposition.lower()
-                ):
-                    try:
-                        body = part.get_payload(decode=True)
-                        if body and "html" not in email_data["body"]:
-                            email_data["body"]["html"] = body.decode(
-                                "utf-8", errors="ignore"
-                            )
-                            logger.debug("Сохранен HTML текст")
-                    except Exception as e:
-                        logger.warning(f"Ошибка декодирования HTML: {e}")
         else:
-            # Простое письмо (не multipart)
             content_type = msg.get_content_type()
             try:
                 body = msg.get_payload(decode=True)
@@ -233,14 +345,9 @@ class EmailHandler:
                         email_data["body"]["plain"] = body.decode(
                             "utf-8", errors="ignore"
                         )
-                    elif content_type == "text/html":
-                        email_data["body"]["html"] = body.decode(
-                            "utf-8", errors="ignore"
-                        )
             except Exception as e:
                 logger.warning(f"Ошибка декодирования тела письма: {e}")
 
-        # Сохранение JSON
         json_filename = f"{email_id}.json"
         json_path = os.path.join(self.data_dir, json_filename)
 
@@ -255,30 +362,24 @@ class EmailHandler:
             logger.error(f"Ошибка сохранения JSON: {e}")
             return False
 
-    def mark_as_processed(self, email_id):
-        """Перемещение письма в папку PROCESSED"""
+    def mark_as_processed(self, email_id, folder):
         try:
-            try:
-                self.mail.create(self.processed_dir)
-                logger.info(f"Создана папка {self.processed_dir}")
-            except:
-                pass
-
-            result = self.mail.copy(email_id, self.processed_dir)
+            result = self.mail.copy(email_id, folder)
             if result[0] == "OK":
                 self.mail.store(email_id, "+FLAGS", "\\Deleted")
                 self.mail.expunge()
-                logger.info(f"Письмо {email_id} перемещено в PROCESSED")
+                logger.info(f"Письмо {email_id} перемещено в {folder}")
                 return True
             else:
-                logger.warning(f"Не удалось переместить письмо {email_id}: {result}")
+                logger.warning(
+                    f"Не удалось переместить письмо {email_id} в {folder}: {result}"
+                )
                 return False
         except Exception as e:
-            logger.error(f"Ошибка при перемещении письма {email_id}: {e}")
+            logger.error(f"Ошибка при перемещении письма {email_id} в {folder}: {e}")
             return False
 
     def get_email_with_retry(self, email_id):
-        """Получение письма с повторными попытками"""
         for attempt in range(self.max_retries):
             try:
                 if attempt % 2 == 0:
@@ -336,34 +437,78 @@ class EmailHandler:
         return None
 
     def process_single_email(self, email_id):
-        """Обработка одного письма"""
         email_id_str = email_id.decode()
+        unique_id = f"{uuid.uuid4().hex}_{email_id_str}"
+
         try:
             msg = self.get_email_with_retry(email_id)
-
             if msg is None:
                 logger.error(f"Не удалось получить письмо {email_id_str}")
                 return False
 
-            unique_id = f"{uuid.uuid4().hex}_{email_id_str}"
-
-            if self.parse_email(msg, unique_id):
-                if self.mark_as_processed(email_id):
-                    logger.info(f"Успешно обработано письмо: {unique_id}")
-                    return True
-                else:
-                    logger.error(f"Не удалось переместить письмо {email_id_str}")
-                    return False
-            else:
+            if not self.parse_email(msg, unique_id):
                 logger.error(f"Не удалось сохранить данные письма {email_id_str}")
                 return False
+
+            json_path = os.path.join(self.data_dir, f"{unique_id}.json")
+            with open(json_path, "r", encoding="utf-8") as f:
+                email_data = json.load(f)
+
+            is_application, confidence, basic_text = self.classify_email_basic(
+                email_data
+            )
+
+            # ============================== !!! FOR DEBUG !!! ==============================
+            # is_application = True
+            # ============================== !!! FOR DEBUG !!! ==============================
+
+            if not is_application:
+                if self.mark_as_processed(email_id, self.spam_dir):
+                    self.delete_email_files(
+                        unique_id, email_data.get("attachments", [])
+                    )
+                    logger.info(
+                        f"Письмо {unique_id} классифицировано как НЕ заявка и перемещено в SPAM"
+                    )
+                else:
+                    logger.error(f"Не удалось переместить письмо {unique_id} в SPAM")
+            else:
+                attachments_text = ""
+                if email_data.get("attachments"):
+                    attachments_text = self.extract_text_from_attachments(
+                        email_data["attachments"]
+                    )
+
+                found_articles = self.article_matcher.find_articles_in_email(
+                    email_data, attachments_text
+                )
+
+                if found_articles:
+                    self.save_application_result(email_data, found_articles)
+                    target_folder = self.correct_dir
+                    logger.info(
+                        f"Письмо {unique_id} классифицировано как ЗАЯВКА с артикулами (уверенность: {confidence:.2%}, найдено артикулов: {len(found_articles)})"
+                    )
+                else:
+                    target_folder = self.incorrect_dir
+                    logger.info(
+                        f"Письмо {unique_id} классифицировано как ЗАЯВКА без артикулов (уверенность: {confidence:.2%})"
+                    )
+
+                if self.mark_as_processed(email_id, target_folder):
+                    logger.info(f"Письмо {unique_id} перемещено в {target_folder}")
+                else:
+                    logger.error(
+                        f"Не удалось переместить письмо {unique_id} в {target_folder}"
+                    )
+
+            return True
 
         except Exception as e:
             logger.error(f"Критическая ошибка обработки письма {email_id_str}: {e}")
             return False
 
     def get_unread_count(self):
-        """Получить количество непрочитанных писем"""
         try:
             if not self.mail:
                 if not self.safe_connect():
@@ -381,7 +526,6 @@ class EmailHandler:
             return 0
 
     def process_emails(self, force_mode=False):
-        """Основной метод обработки писем"""
         if not self.safe_connect():
             logger.error("Не удалось подключиться к серверу")
             return
@@ -406,6 +550,9 @@ class EmailHandler:
 
             processed_count = 0
             error_count = 0
+            spam_count = 0
+            correct_count = 0
+            incorrect_count = 0
 
             for i, email_id in enumerate(email_ids):
                 email_id_str = email_id.decode()
@@ -415,6 +562,7 @@ class EmailHandler:
 
                 if self.process_single_email(email_id):
                     processed_count += 1
+
                 else:
                     error_count += 1
 
@@ -424,22 +572,46 @@ class EmailHandler:
                     )
                     time.sleep(self.delay_between_emails)
 
+            try:
+                self.mail.select(self.correct_dir)
+                status, correct_messages = self.mail.search(None, "ALL")
+                correct_count = (
+                    len(correct_messages[0].split()) if status == "OK" else 0
+                )
+
+                self.mail.select(self.incorrect_dir)
+                status, incorrect_messages = self.mail.search(None, "ALL")
+                incorrect_count = (
+                    len(incorrect_messages[0].split()) if status == "OK" else 0
+                )
+
+                self.mail.select(self.spam_dir)
+                status, spam_messages = self.mail.search(None, "ALL")
+                spam_count = len(spam_messages[0].split()) if status == "OK" else 0
+
+            except Exception as e:
+                logger.warning(f"Не удалось получить статистику по папкам: {e}")
+
             logger.info(
                 f"Обработка завершена: {processed_count} успешно, {error_count} с ошибками"
             )
+            logger.info(
+                f"Статистика: CORRECT={correct_count}, INCORRECT={incorrect_count}, SPAM={spam_count}"
+            )
 
-            # Получаем оставшееся количество непрочитанных писем
             remaining = self.get_unread_count()
 
             print(
                 f"РЕЗУЛЬТАТ: Обработано {processed_count} писем, ошибок: {error_count}"
+            )
+            print(
+                f"Статистика: CORRECT={correct_count}, INCORRECT={incorrect_count}, SPAM={spam_count}"
             )
             print(f"ОСТАЛОСЬ: {remaining} непрочитанных писем")
 
             if remaining > 0:
                 logger.info(f"Осталось непрочитанных писем: {remaining}")
 
-            # Если включен форсированный режим и есть ошибки или остались письма - повторяем
             if force_mode and (error_count > 0 or remaining > 0):
                 logger.info("Форсированный режим: повторная попытка обработки...")
                 time.sleep(5)
@@ -447,7 +619,6 @@ class EmailHandler:
 
         except Exception as e:
             logger.error(f"Ошибка в процессе обработки: {e}")
-            # В форсированном режиме переподключаемся и пробуем снова
             if force_mode:
                 logger.info("Форсированный режим: повторная попытка после ошибки...")
                 time.sleep(10)
@@ -458,7 +629,6 @@ class EmailHandler:
 
 
 def main(force_mode=False):
-    """Основная функция"""
     logger.info(
         "Запуск обработки писем" + (" в форсированном режиме" if force_mode else "")
     )
