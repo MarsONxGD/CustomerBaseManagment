@@ -8,22 +8,52 @@ import time
 import uuid
 from email.header import decode_header
 
+from src.tools.ANSIColorFormatter import ANSIColorFormatter
 from article_matcher import ArticleMatcher
 from attachment_processor import AttachmentProcessor
 from config.email_config import credentials
-from email_classifier.predict import EmailClassifierPredictor
+from email_classifier.predict import predict_single_text
 
 sys.path.append(os.path.dirname(__file__))
-os.makedirs("../log", exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("../log/softwarecbm.log", encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
-)
-logger = logging.getLogger(__name__)
+
+
+def setup_logging():
+    os.makedirs("../log", exist_ok=True)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(
+        ANSIColorFormatter("%(asctime)s - %(levelname)s - %(message)s")
+    )
+    console_handler.setLevel(logging.INFO)
+
+    file_handler = logging.FileHandler("../log/softwarecbm.log", encoding="utf-8")
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(levelname)s : %(name)s - %(message)s")
+    )
+    file_handler.setLevel(logging.INFO)
+
+    # warning_file_handler = logging.FileHandler("../log/softwarecbm_debug.log", encoding="utf-8")
+    # warning_file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s : %(name)s - %(message)s"))
+    # warning_file_handler.setLevel(logging.WARNING)
+
+    logging.basicConfig(
+        level=logging.DEBUG,
+        handlers=[
+            console_handler,
+            file_handler,
+            # warning_file_handler,
+        ],
+    )
+
+    if __name__ == "__main__":
+        output = logging.getLogger("email_handler")
+    else:
+        output = logging.getLogger(__name__)
+
+    return output
+
+
+logger = setup_logging()
 
 
 def decode_mime_words(text):
@@ -54,13 +84,14 @@ class EmailHandler:
         self.attachments_dir = "../temp/email/attachments"
         self.results_dir = "../temp/results"
 
-        self.classifier = EmailClassifierPredictor()
         self.attachment_processor = AttachmentProcessor()
         self.article_matcher = ArticleMatcher()
 
-        self.max_emails_per_run = 10
-        self.delay_between_emails = 1
-        self.max_retries = 3
+        self.max_emails_per_run = 50
+        self.delay_between_emails = 0
+        self.delay_reconnect = 5
+        self.socket_timeout = 120
+        self.max_retries = 2
 
         os.makedirs(self.data_dir, exist_ok=True)
         os.makedirs(self.attachments_dir, exist_ok=True)
@@ -77,7 +108,7 @@ class EmailHandler:
             for folder in folders:
                 try:
                     self.mail.create(folder)
-                    logger.info(f"Создана папка {folder}")
+                    logger.debug(f"Создана папка {folder}")
                 except Exception as e:
                     logger.debug(
                         f"Папка {folder} уже существует или не может быть создана: {e}"
@@ -85,7 +116,8 @@ class EmailHandler:
         except Exception as e:
             logger.error(f"Ошибка при создании папок: {e}")
 
-    def classify_email_basic(self, email_data):
+    @staticmethod
+    def classify_email_basic(email_data):
         try:
             text_parts = []
             if "body" in email_data:
@@ -95,7 +127,11 @@ class EmailHandler:
             email_text = "\n".join(text_parts)
             email_text += f"\n{email_data.get('subject', '')}"
 
-            prediction = self.classifier.predict(email_text)
+            # ============================== !!! FOR DEBUG !!! ==============================
+            # print(email_text)
+            # ============================== !!! FOR DEBUG !!! ==============================
+
+            prediction = predict_single_text(email_text)
 
             logger.info(
                 f"Классификация письма {email_data['id']}: {prediction['class_name']} (уверенность: {prediction['confidence']:.2%})"
@@ -126,7 +162,6 @@ class EmailHandler:
                     attachment_path
                 )
                 if extracted_text:
-                    # combined_text += f"\n--- Текст из вложения {attachment['filename']} ---\n"
                     combined_text += extracted_text + "\n"
 
         return combined_text
@@ -203,7 +238,7 @@ class EmailHandler:
             self.mail = imaplib.IMAP4_SSL(
                 self.config["imap_server"], self.config["imap_port"]
             )
-            self.mail.socket().settimeout(60)
+            self.mail.socket().settimeout(self.socket_timeout)
             self.mail.login(self.config["email"], self.config["password"])
             logger.info("Успешное подключение к почтовому серверу")
 
@@ -322,9 +357,8 @@ class EmailHandler:
                         email_data["attachments"].append(attachment_info)
                     continue
 
-                if (
-                        content_type == "text/plain"
-                        and "attachment" not in content_disposition.lower()
+                if (content_type == "text/plain") and (
+                    "attachment" not in content_disposition.lower()
                 ):
                     try:
                         body = part.get_payload(decode=True)
@@ -364,30 +398,54 @@ class EmailHandler:
 
     def mark_as_processed(self, email_id, folder):
         try:
-            result = self.mail.copy(email_id, folder)
+            result = self.mail.uid("COPY", email_id, folder)
             if result[0] == "OK":
-                self.mail.store(email_id, "+FLAGS", "\\Deleted")
+                self.mail.uid("STORE", email_id, "+FLAGS", "\\Deleted")
                 self.mail.expunge()
-                logger.info(f"Письмо {email_id} перемещено в {folder}")
+                logger.info(f"Письмо UID {email_id} перемещено в {folder}")
                 return True
             else:
                 logger.warning(
-                    f"Не удалось переместить письмо {email_id} в {folder}: {result}"
+                    f"Не удалось переместить письмо UID {email_id} в {folder}: {result}"
                 )
                 return False
         except Exception as e:
-            logger.error(f"Ошибка при перемещении письма {email_id} в {folder}: {e}")
+            logger.error(
+                f"Ошибка при перемещении письма UID {email_id} в {folder}: {e}"
+            )
             return False
 
     def get_email_with_retry(self, email_id):
         for attempt in range(self.max_retries):
             try:
-                if attempt % 2 == 0:
-                    status, msg_data = self.mail.fetch(email_id, "(RFC822)")
-                else:
-                    status, msg_data = self.mail.fetch(email_id, "(BODY.PEEK[])")
+                if attempt > 0:
+                    logger.warning(
+                        f"Попытка {attempt + 1} для письма {email_id}, переподключение..."
+                    )
+                    self.disconnect()
+                    if self.delay_reconnect > 0:
+                        logger.warning(
+                            f"Пауза {self.delay_reconnect} перед переподключением..."
+                        )
+                        time.sleep(self.delay_reconnect)
+                    if not self.safe_connect():
+                        continue
+                    self.mail.select("INBOX")
 
-                if status != "OK" or not msg_data:
+                if attempt < self.max_retries - 1:
+                    status, msg_data = self.mail.uid("FETCH", email_id, "(BODY.PEEK[])")
+                else:
+                    status, msg_data = self.mail.uid("FETCH", email_id, "(RFC822)")
+
+                if status != "OK":
+                    logger.warning(
+                        f"Попытка {attempt + 1} для {email_id}: статус {status}"
+                    )
+                    if attempt < self.max_retries - 1:
+                        time.sleep(1)
+                    continue
+
+                if not msg_data or msg_data == [None]:
                     logger.warning(
                         f"Попытка {attempt + 1} для {email_id}: пустой ответ"
                     )
@@ -401,24 +459,24 @@ class EmailHandler:
                             try:
                                 msg = email.message_from_bytes(item[1])
                                 logger.info(
-                                    f"Письмо {email_id} успешно получено (попытка {attempt + 1})"
+                                    f"Письмо UID {email_id} успешно получено (попытка {attempt + 1})"
                                 )
                                 return msg
                             except Exception as e:
                                 logger.warning(
-                                    f"Ошибка парсинга письма {email_id} (попытка {attempt + 1}): {e}"
+                                    f"Ошибка парсинга письма UID {email_id} (попытка {attempt + 1}): {e}"
                                 )
 
                     elif isinstance(item, bytes) and len(item) > 100:
                         try:
                             msg = email.message_from_bytes(item)
                             logger.info(
-                                f"Письмо {email_id} успешно получено (попытка {attempt + 1})"
+                                f"Письмо UID {email_id} успешно получено (попытка {attempt + 1})"
                             )
                             return msg
                         except Exception as e:
                             logger.warning(
-                                f"Ошибка парсинга письма {email_id} (попытка {attempt + 1}): {e}"
+                                f"Ошибка парсинга письма UID {email_id} (попытка {attempt + 1}): {e}"
                             )
 
                 if attempt < self.max_retries - 1:
@@ -426,13 +484,13 @@ class EmailHandler:
 
             except Exception as e:
                 logger.warning(
-                    f"Ошибка получения письма {email_id} (попытка {attempt + 1}): {e}"
+                    f"Ошибка получения письма UID {email_id} (попытка {attempt + 1}): {e}"
                 )
                 if attempt < self.max_retries - 1:
                     time.sleep(2)
 
         logger.error(
-            f"Не удалось получить письмо {email_id} после {self.max_retries} попыток"
+            f"Не удалось получить письмо UID {email_id} после {self.max_retries} попыток"
         )
         return None
 
@@ -515,7 +573,7 @@ class EmailHandler:
                     return 0
 
             self.mail.select("INBOX")
-            status, messages = self.mail.search(None, "UNSEEN")
+            status, messages = self.mail.uid("SEARCH", None, "UNSEEN")
 
             if status == "OK":
                 return len(messages[0].split())
@@ -532,7 +590,7 @@ class EmailHandler:
 
         try:
             self.mail.select("INBOX")
-            status, messages = self.mail.search(None, "UNSEEN")
+            status, messages = self.mail.uid("SEARCH", None, "UNSEEN")
 
             if status != "OK":
                 logger.error("Ошибка поиска писем")
@@ -557,16 +615,15 @@ class EmailHandler:
             for i, email_id in enumerate(email_ids):
                 email_id_str = email_id.decode()
                 logger.info(
-                    f"Обработка письма {i + 1}/{len(email_ids)}: {email_id_str}"
+                    f"Обработка письма {i + 1}/{len(email_ids)}: UID {email_id_str}"
                 )
 
                 if self.process_single_email(email_id):
                     processed_count += 1
-
                 else:
                     error_count += 1
 
-                if i < len(email_ids) - 1:
+                if (self.delay_between_emails > 0) and (i < len(email_ids) - 1):
                     logger.info(
                         f"Пауза {self.delay_between_emails} секунд перед следующим письмом..."
                     )
@@ -574,19 +631,19 @@ class EmailHandler:
 
             try:
                 self.mail.select(self.correct_dir)
-                status, correct_messages = self.mail.search(None, "ALL")
+                status, correct_messages = self.mail.uid("SEARCH", None, "ALL")
                 correct_count = (
                     len(correct_messages[0].split()) if status == "OK" else 0
                 )
 
                 self.mail.select(self.incorrect_dir)
-                status, incorrect_messages = self.mail.search(None, "ALL")
+                status, incorrect_messages = self.mail.uid("SEARCH", None, "ALL")
                 incorrect_count = (
                     len(incorrect_messages[0].split()) if status == "OK" else 0
                 )
 
                 self.mail.select(self.spam_dir)
-                status, spam_messages = self.mail.search(None, "ALL")
+                status, spam_messages = self.mail.uid("SEARCH", None, "ALL")
                 spam_count = len(spam_messages[0].split()) if status == "OK" else 0
 
             except Exception as e:
@@ -633,14 +690,12 @@ def main(force_mode=False):
         "Запуск обработки писем" + (" в форсированном режиме" if force_mode else "")
     )
 
-    handler = EmailHandler()
-    handler.process_emails(force_mode=force_mode)
+    email_handler = EmailHandler()
+    email_handler.process_emails(force_mode=force_mode)
 
     logger.info("Обработка писем завершена")
 
 
 if __name__ == "__main__":
-    import sys
-
     force_mode = len(sys.argv) > 1 and sys.argv[1] == "--force"
     main(force_mode=force_mode)
