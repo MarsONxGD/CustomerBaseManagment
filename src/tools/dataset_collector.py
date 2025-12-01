@@ -1,7 +1,6 @@
 import email
 import imaplib
 import logging
-import os
 import re
 import sys
 from pathlib import Path
