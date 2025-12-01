@@ -7,18 +7,21 @@ import sys
 import time
 import uuid
 from email.header import decode_header
+from pathlib import Path
 
-from src.tools.ANSIColorFormatter import ANSIColorFormatter
-from article_matcher import ArticleMatcher
-from attachment_processor import AttachmentProcessor
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.append(str(PROJECT_ROOT))
+
 from config.email_config import credentials
-from email_classifier.predict import predict_single_text
-
-sys.path.append(os.path.dirname(__file__))
+from src.email_classifier.predict import predict_single_text
+from src.tools.ANSIColorFormatter import ANSIColorFormatter
+from src.tools.article_matcher import ArticleMatcher
+from src.tools.attachment_processor import AttachmentProcessor
 
 
 def setup_logging():
-    os.makedirs("../log", exist_ok=True)
+    log_dir = PROJECT_ROOT / "log"
+    log_dir.mkdir(exist_ok=True)
 
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(
@@ -26,22 +29,18 @@ def setup_logging():
     )
     console_handler.setLevel(logging.INFO)
 
-    file_handler = logging.FileHandler("../log/softwarecbm.log", encoding="utf-8")
+    log_file = log_dir / "softwarecbm.log"
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s - %(levelname)s : %(name)s - %(message)s")
     )
     file_handler.setLevel(logging.INFO)
-
-    # warning_file_handler = logging.FileHandler("../log/softwarecbm_debug.log", encoding="utf-8")
-    # warning_file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s : %(name)s - %(message)s"))
-    # warning_file_handler.setLevel(logging.WARNING)
 
     logging.basicConfig(
         level=logging.DEBUG,
         handlers=[
             console_handler,
             file_handler,
-            # warning_file_handler,
         ],
     )
 
@@ -56,22 +55,6 @@ def setup_logging():
 logger = setup_logging()
 
 
-def decode_mime_words(text):
-    if text is None:
-        return ""
-    decoded_parts = decode_header(text)
-    decoded_text = ""
-    for part, encoding in decoded_parts:
-        if isinstance(part, bytes):
-            if encoding:
-                decoded_text += part.decode(encoding)
-            else:
-                decoded_text += part.decode("utf-8", errors="ignore")
-        else:
-            decoded_text += part
-    return decoded_text
-
-
 class EmailHandler:
     def __init__(self):
         self.config = credentials()
@@ -80,9 +63,10 @@ class EmailHandler:
         self.spam_dir = "PROCESSED/SPAM"
         self.correct_dir = "PROCESSED/CORRECT"
         self.incorrect_dir = "PROCESSED/INCORRECT"
-        self.data_dir = "../temp/email"
-        self.attachments_dir = "../temp/email/attachments"
-        self.results_dir = "../temp/results"
+
+        self.data_dir = PROJECT_ROOT / "temp" / "email"
+        self.attachments_dir = PROJECT_ROOT / "temp" / "email" / "attachments"
+        self.results_dir = PROJECT_ROOT / "temp" / "results"
 
         self.attachment_processor = AttachmentProcessor()
         self.article_matcher = ArticleMatcher()
@@ -93,9 +77,54 @@ class EmailHandler:
         self.socket_timeout = 120
         self.max_retries = 2
 
-        os.makedirs(self.data_dir, exist_ok=True)
-        os.makedirs(self.attachments_dir, exist_ok=True)
-        os.makedirs(self.results_dir, exist_ok=True)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.attachments_dir.mkdir(parents=True, exist_ok=True)
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def decode_mime_words(text):
+        if text is None:
+            return ""
+        decoded_parts = decode_header(text)
+        decoded_text = ""
+        for part, encoding in decoded_parts:
+            if isinstance(part, bytes):
+                if encoding:
+                    decoded_text += part.decode(encoding)
+                else:
+                    decoded_text += part.decode("utf-8", errors="ignore")
+            else:
+                decoded_text += part
+        return decoded_text
+
+    @staticmethod
+    def classify_email_basic(email_data):
+        try:
+            text_parts = []
+            if "body" in email_data:
+                if "plain" in email_data["body"]:
+                    text_parts.append(email_data["body"]["plain"])
+
+            email_text = "\n".join(text_parts)
+            email_text += f"\n{email_data.get('subject', '')}"
+
+            prediction = predict_single_text(email_text)
+
+            logger.info(
+                f"Классификация письма {email_data['id']}: {prediction['class_name']} (уверенность: {prediction['confidence']:.2%})"
+            )
+
+            return (
+                prediction["class_name"] == "Заявка",
+                prediction["confidence"],
+                email_text,
+            )
+
+        except Exception as e:
+            logger.error(
+                f"Ошибка при классификации письма {email_data.get('id', 'unknown')}: {e}"
+            )
+            return False, 0.0, ""
 
     def create_processed_folders(self):
         try:
@@ -116,50 +145,15 @@ class EmailHandler:
         except Exception as e:
             logger.error(f"Ошибка при создании папок: {e}")
 
-    @staticmethod
-    def classify_email_basic(email_data):
-        try:
-            text_parts = []
-            if "body" in email_data:
-                if "plain" in email_data["body"]:
-                    text_parts.append(email_data["body"]["plain"])
-
-            email_text = "\n".join(text_parts)
-            email_text += f"\n{email_data.get('subject', '')}"
-
-            # ============================== !!! FOR DEBUG !!! ==============================
-            # print(email_text)
-            # ============================== !!! FOR DEBUG !!! ==============================
-
-            prediction = predict_single_text(email_text)
-
-            logger.info(
-                f"Классификация письма {email_data['id']}: {prediction['class_name']} (уверенность: {prediction['confidence']:.2%})"
-            )
-
-            return (
-                prediction["class_name"] == "Заявка",
-                prediction["confidence"],
-                email_text,
-            )
-
-        except Exception as e:
-            logger.error(
-                f"Ошибка при классификации письма {email_data.get('id', 'unknown')}: {e}"
-            )
-            return False, 0.0, ""
-
     def extract_text_from_attachments(self, attachments):
         combined_text = ""
 
         for attachment in attachments:
-            attachment_path = os.path.join(
-                self.attachments_dir, attachment["saved_name"]
-            )
-            if os.path.exists(attachment_path):
+            attachment_path = self.attachments_dir / attachment["saved_name"]
+            if attachment_path.exists():
                 logger.info(f"Обработка вложения: {attachment['filename']}")
                 extracted_text = self.attachment_processor.extract_text_from_file(
-                    attachment_path
+                    str(attachment_path)
                 )
                 if extracted_text:
                     combined_text += extracted_text + "\n"
@@ -168,17 +162,15 @@ class EmailHandler:
 
     def delete_email_files(self, email_id, attachments):
         try:
-            json_path = os.path.join(self.data_dir, f"{email_id}.json")
-            if os.path.exists(json_path):
-                os.remove(json_path)
+            json_path = self.data_dir / f"{email_id}.json"
+            if json_path.exists():
+                json_path.unlink()
                 logger.info(f"Удален JSON файл: {json_path}")
 
             for attachment in attachments:
-                attachment_path = os.path.join(
-                    self.attachments_dir, attachment["saved_name"]
-                )
-                if os.path.exists(attachment_path):
-                    os.remove(attachment_path)
+                attachment_path = self.attachments_dir / attachment["saved_name"]
+                if attachment_path.exists():
+                    attachment_path.unlink()
                     logger.info(f"Удалено вложение: {attachment_path}")
 
             return True
@@ -205,13 +197,13 @@ class EmailHandler:
             }
 
             result_filename = f"application_{email_data['id']}.json"
-            result_path = os.path.join(self.results_dir, result_filename)
+            result_path = self.results_dir / result_filename
 
             with open(result_path, "w", encoding="utf-8") as f:
                 json.dump(result, f, ensure_ascii=False, indent=2)
 
-            csv_path = os.path.join(self.results_dir, "applications.csv")
-            csv_header = not os.path.exists(csv_path)
+            csv_path = self.results_dir / "applications.csv"
+            csv_header = not csv_path.exists()
 
             with open(csv_path, "a", encoding="utf-8") as f:
                 if csv_header:
@@ -291,15 +283,15 @@ class EmailHandler:
     def save_attachment(self, part, email_id, attachment_number):
         filename = part.get_filename()
         if filename:
-            filename = decode_mime_words(filename)
+            filename = self.decode_mime_words(filename)
             if not filename:
                 filename = f"attachment_{uuid.uuid4().hex}"
 
             filename = "".join(
                 c for c in filename if c.isalnum() or c in (" ", "-", "_", ".")
             ).rstrip()
-            filepath = os.path.join(
-                self.attachments_dir, f"{email_id}_{attachment_number}_{filename}"
+            filepath = (
+                self.attachments_dir / f"{email_id}_{attachment_number}_{filename}"
             )
 
             try:
@@ -329,8 +321,8 @@ class EmailHandler:
     def parse_email(self, msg, email_id):
         email_data = {
             "id": email_id,
-            "subject": decode_mime_words(msg.get("Subject")),
-            "from": decode_mime_words(msg.get("From")),
+            "subject": self.decode_mime_words(msg.get("Subject")),
+            "from": self.decode_mime_words(msg.get("From")),
             "date": msg.get("Date"),
             "body": {},
             "attachments": [],
@@ -383,7 +375,7 @@ class EmailHandler:
                 logger.warning(f"Ошибка декодирования тела письма: {e}")
 
         json_filename = f"{email_id}.json"
-        json_path = os.path.join(self.data_dir, json_filename)
+        json_path = self.data_dir / json_filename
 
         try:
             with open(json_path, "w", encoding="utf-8") as f:
@@ -516,10 +508,7 @@ class EmailHandler:
                 email_data
             )
 
-            # ============================== !!! FOR DEBUG !!! ==============================
             # is_application = True
-            # ============================== !!! FOR DEBUG !!! ==============================
-
             if not is_application:
                 if self.mark_as_processed(email_id, self.spam_dir):
                     self.delete_email_files(

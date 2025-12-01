@@ -4,35 +4,40 @@ import os
 import re
 import sys
 from collections import Counter
+from pathlib import Path
 
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from nltk.corpus import stopwords
+from nltk.stem import SnowballStemmer
+from nltk.tokenize import word_tokenize
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
 
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
-from nltk.stem import SnowballStemmer
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.append(str(PROJECT_ROOT))
 
 from src.tools.ANSIColorFormatter import ANSIColorFormatter
 from src.email_classifier.model import EmailClassifier
 
 
 def setup_logging():
-    os.makedirs("../log", exist_ok=True)
+    log_dir = PROJECT_ROOT / "log"
+    log_dir.mkdir(exist_ok=True)
 
     logging_handler = logging.StreamHandler()
     logging_handler.setFormatter(
         ANSIColorFormatter("%(asctime)s - %(levelname)s - %(message)s")
     )
 
+    log_file = log_dir / "train.log"
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s - %(levelname)s : %(name)s - %(message)s",
         handlers=[
-            logging.FileHandler("../../log/train.log", encoding="utf-8"),
+            logging.FileHandler(log_file, encoding="utf-8"),
             logging_handler,
         ],
     )
@@ -62,12 +67,10 @@ class TextDataset(Dataset):
         text = self.texts[idx]
         label = self.labels[idx]
 
-        # Токенизация и преобразование в индексы
         tokens = tokenize(text)
         indexed = [self.vocab.get(token, self.vocab["<UNK>"]) for token in tokens]
         text_length = min(len(indexed), self.max_length)
 
-        # Обрезка или паддинг до max_length
         if len(indexed) > self.max_length:
             indexed = indexed[: self.max_length]
         else:
@@ -87,13 +90,11 @@ class TextProcessor:
 
     def build_vocab(self, texts, min_freq=2):
         logger.info(f"Построение словаря с min_freq={min_freq}")
-        # Сбор всех токенов
         counter = Counter()
         for text in texts:
             tokens = tokenize(text)
             counter.update(tokens)
 
-        # Создание словаря
         self.vocab = {"<PAD>": 0, "<UNK>": 1}
         idx = 2
         for token, count in counter.items():
@@ -123,14 +124,12 @@ def tokenize(text):
 
 
 def collate_fn(batch):
-    """Функция для создания батчей с разной длиной последовательностей"""
     texts, lengths, labels = zip(*batch)
 
     texts = torch.stack(texts)
     lengths = torch.stack(lengths)
     labels = torch.stack(labels)
 
-    # Сортируем по длине для эффективности LSTM
     lengths, sort_idx = lengths.sort(descending=True)
     texts = texts[sort_idx]
     labels = labels[sort_idx]
@@ -140,7 +139,6 @@ def collate_fn(batch):
 
 def train_model():
     logger.info("Запуск обучения модели EmailClassifier")
-    # Параметры
     BATCH_SIZE = 16
     EMBEDDING_DIM = 128
     HIDDEN_DIM = 64
@@ -162,15 +160,19 @@ def train_model():
     logger.info(f"  LEARNING_RATE: {LEARNING_RATE}")
     logger.info(f"  MAX_LENGTH: {MAX_LENGTH}")
 
-    # Загрузка данных - ТОЛЬКО ИЗ CSV ФАЙЛА
+    dataset_path = PROJECT_ROOT / "datasets" / "data.csv"
+    models_dir = PROJECT_ROOT / "models"
+    models_dir.mkdir(exist_ok=True)
+    vocab_path = models_dir / "vocabulary.json"
+    model_path = models_dir / "email_classifier.pth"
+
     try:
-        logger.info("Загрузка данных из data.csv")
-        df = pd.read_csv("../../datasets/data.csv")
+        logger.info(f"Загрузка данных из {dataset_path}")
+        df = pd.read_csv(dataset_path)
         texts = df["text"].tolist()
         labels = df["label"].tolist()
         logger.info(f"Загружено {len(texts)} примеров из data.csv")
 
-        # Проверка наличия необходимых колонок
         if "text" not in df.columns or "label" not in df.columns:
             error_msg = (
                 "ОШИБКА: Файл data.csv должен содержать колонки 'text' и 'label'"
@@ -179,7 +181,7 @@ def train_model():
             sys.exit(1)
 
     except FileNotFoundError:
-        error_msg = "ОШИБКА: Файл data.csv не найден!"
+        error_msg = f"ОШИБКА: Файл {dataset_path} не найден!"
         logger.error(error_msg)
         print("Пожалуйста, создайте файл data.csv с колонками 'text' и 'label'")
         sys.exit(1)
@@ -188,26 +190,22 @@ def train_model():
         logger.error(error_msg)
         sys.exit(1)
 
-    # Проверка, что есть данные для обучения
     if len(texts) == 0:
         error_msg = "ОШИБКА: Файл data.csv не содержит данных"
         logger.error(error_msg)
         sys.exit(1)
 
-    # Предобработка текстов
     logger.info("Начало предобработки текстов")
     processor = TextProcessor()
     processor.build_vocab(texts)
 
-    # Сохранение словаря
     try:
-        with open("../../models/vocabulary.json", "w", encoding="utf-8") as f:
+        with open(vocab_path, "w", encoding="utf-8") as f:
             json.dump(processor.vocab, f, ensure_ascii=False)
-        logger.info(f"Словарь сохранен в ../../models/vocabulary.json")
+        logger.info(f"Словарь сохранен в {vocab_path}")
     except Exception as e:
         logger.error(f"Ошибка при сохранении словаря: {e}")
 
-    # Разделение на train/validation
     logger.info("Разделение данных на train/validation")
     train_texts, val_texts, train_labels, val_labels = train_test_split(
         texts, labels, test_size=0.2, random_state=42, stratify=labels
@@ -217,7 +215,6 @@ def train_model():
         f"Train: {len(train_texts)} примеров, Validation: {len(val_texts)} примеров"
     )
 
-    # Создание датасетов и даталоадеров
     train_dataset = TextDataset(train_texts, train_labels, processor.vocab, MAX_LENGTH)
     val_dataset = TextDataset(val_texts, val_labels, processor.vocab, MAX_LENGTH)
 
@@ -226,7 +223,6 @@ def train_model():
     )
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, collate_fn=collate_fn)
 
-    # Инициализация модели
     logger.info("Инициализация модели EmailClassifier")
     model = EmailClassifier(
         vocab_size=processor.vocab_size,
@@ -245,12 +241,10 @@ def train_model():
     logger.info(f"- LSTM layers: {N_LAYERS}")
     logger.info(f"- Bidirectional: True")
 
-    # Функция потерь и оптимизатор
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     logger.info(f"Оптимизатор: Adam, LR: {LEARNING_RATE}")
 
-    # Обучение
     train_losses = []
     val_losses = []
     val_accuracies = []
@@ -259,7 +253,6 @@ def train_model():
     logger.info("-" * 60)
 
     for epoch in range(N_EPOCHS):
-        # Training
         model.train()
         train_loss = 0
         for i, (texts_batch, lengths_batch, labels_batch) in enumerate(train_loader):
@@ -273,7 +266,6 @@ def train_model():
 
             train_loss += loss.item()
 
-        # Validation
         model.eval()
         val_loss = 0
         correct = 0
@@ -297,14 +289,12 @@ def train_model():
         val_losses.append(val_loss_avg)
         val_accuracies.append(val_accuracy)
 
-        # Логирование прогресса эпохи
         logger.info(f"Epoch {epoch + 1:2d}/{N_EPOCHS}:")
         logger.info(f"  Train Loss: {train_loss_avg:.4f}")
         logger.info(f"  Val Loss:   {val_loss_avg:.4f}")
         logger.info(f"  Val Accuracy: {val_accuracy:6.2f}%")
         logger.info("-" * 40)
 
-    # Сохранение модели
     try:
         torch.save(
             {
@@ -317,9 +307,9 @@ def train_model():
                 "dropout": DROPOUT,
                 "bidirectional": True,
             },
-            "../../models/email_classifier.pth",
+            model_path,
         )
-        logger.info("Модель успешно сохранена в ../../models/email_classifier.pth")
+        logger.info(f"Модель успешно сохранена в {model_path}")
     except Exception as e:
         logger.error(f"Ошибка при сохранении модели: {e}")
 
@@ -328,7 +318,6 @@ def train_model():
 
 
 if __name__ == "__main__":
-    # ============================== !!! STEM TOGGLE !!! ==============================
     stem = True
     if stem:
         stemmer = SnowballStemmer("russian")

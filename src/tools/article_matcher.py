@@ -7,13 +7,18 @@ logger = logging.getLogger(__name__)
 
 
 class ArticleMatcher:
-    def __init__(self, articles_file_path="../config/articles.json"):
-        self.articles_file_path = articles_file_path
+    def __init__(self, articles_file_path=None):
+        if articles_file_path is None:
+            project_root = Path(__file__).resolve().parent.parent.parent
+            self.articles_file_path = project_root / "config" / "articles.json"
+        else:
+            self.articles_file_path = Path(articles_file_path)
+
         self.articles = self.load_articles()
 
     def load_articles(self):
         try:
-            if Path(self.articles_file_path).exists():
+            if self.articles_file_path.exists():
                 with open(self.articles_file_path, "r", encoding="utf-8") as f:
                     articles_data = json.load(f)
 

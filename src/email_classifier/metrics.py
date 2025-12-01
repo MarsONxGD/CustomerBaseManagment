@@ -1,4 +1,7 @@
 import json
+import os
+import sys
+from pathlib import Path
 
 import pandas as pd
 import torch
@@ -8,8 +11,11 @@ from sklearn.metrics import (
     confusion_matrix,
     f1_score,
     precision_score,
-    recall_score
+    recall_score,
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.append(str(PROJECT_ROOT))
 
 from src.email_classifier.model import EmailClassifier
 
@@ -37,18 +43,20 @@ def load_model_and_vocab(model_path, vocab_path):
 
 
 def calculate_metrics():
-    model, vocab = load_model_and_vocab(
-        "../../models/email_classifier.pth", "../../models/vocabulary.json"
-    )
+    model_path = PROJECT_ROOT / "models" / "email_classifier.pth"
+    vocab_path = PROJECT_ROOT / "models" / "vocabulary.json"
+    test_data_path = PROJECT_ROOT / "datasets" / "test_data.csv"
+
+    model, vocab = load_model_and_vocab(model_path, vocab_path)
     print("✅ Модель и словарь загружены")
 
     try:
-        df = pd.read_csv("../../datasets/test_data.csv")
+        df = pd.read_csv(test_data_path)
         texts = df["text"].tolist()
         true_labels = df["label"].tolist()
         print(f"✅ Загружено {len(texts)} тестовых примеров")
     except FileNotFoundError:
-        print("❌ ОШИБКА: Файл test_data.csv не найден!")
+        print(f"❌ ОШИБКА: Файл {test_data_path} не найден!")
         return
 
     predicted_labels = []
@@ -113,7 +121,7 @@ def calculate_metrics():
 
     correct_count = 0
     for i, (true, pred, prob, text) in enumerate(
-            zip(true_labels, predicted_labels, predicted_probs, texts)
+        zip(true_labels, predicted_labels, predicted_probs, texts)
     ):
         status = "✅" if true == pred else "❌"
         if true == pred:
